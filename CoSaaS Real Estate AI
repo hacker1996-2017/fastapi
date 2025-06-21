@@ -1,0 +1,577 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pydantic[email]
+python-dotenv
+openai
+passlib[bcrypt]
+python-jose[cryptography]
+fastapi-cors
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Dependency to get a DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+from sqlalchemy import Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import relationship
+from .database import Base
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    properties = relationship("Property", back_populates="owner")
+
+class Property(Base):
+    __tablename__ = "properties"
+    id = Column(Integer, primary_key=True, index=True)
+    address = Column(String, index=True)
+    bedrooms = Column(Integer)
+    bathrooms = Column(Float)
+    features = Column(String) # Simple text field for features
+    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="properties")
+from pydantic import BaseModel, EmailStr
+from typing import Optional, List
+
+# Property Schemas
+class PropertyBase(BaseModel):
+    address: str
+    bedrooms: int
+    bathrooms: float
+    features: str
+
+class PropertyCreate(PropertyBase):
+    pass
+
+class Property(PropertyBase):
+    id: int
+    owner_id: int
+
+    class Config:
+        orm_mode = True
+
+# User Schemas
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str
+
+class User(UserBase):
+    id: int
+    properties: List[Property] = []
+
+    class Config:
+        orm_mode = True
+
+# Auth Schemas
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+from sqlalchemy.orm import Session
+from . import models, schemas
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def get_user_by_email(db: Session, email: str):
+    return db.query(models.User).filter(models.User.email == email).first()
+
+def create_user(db: Session, user: schemas.UserCreate):
+    hashed_password = pwd_context.hash(user.password)
+    db_user = models.User(email=user.email, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+def create_user_property(db: Session, prop: schemas.PropertyCreate, user_id: int):
+    db_property = models.Property(**prop.dict(), owner_id=user_id)
+    db.add(db_property)
+    db.commit()
+    db.refresh(db_property)
+    return db_property
+
+def get_properties_by_user(db: Session, user_id: int):
+    return db.query(models.Property).filter(models.Property.owner_id == user_id).all()
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .database import engine, Base
+from .routers import auth, properties, ai_assistant
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Real Estate AI Chief of Staff MVP")
+
+# CORS (Cross-Origin Resource Sharing)
+# This allows your frontend (running on a different port) to talk to your backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], # The origin of your React app
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include API routers
+app.include_router(auth.router, tags=["Authentication"])
+app.include_router(properties.router, prefix="/api", tags=["Properties"])
+app.include_router(ai_assistant.router, prefix="/api", tags=["AI Assistant"])
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Real Estate AI Assistant API"}
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from datetime import timedelta
+import os
+
+from .. import schemas, crud, models
+from ..database import get_db
+from ..deps import create_access_token, get_current_user, pwd_context
+
+router = APIRouter()
+
+@router.post("/register", response_model=schemas.User)
+def register_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = crud.get_user_by_email(db, email=user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    return crud.create_user(db=db, user=user)
+
+@router.post("/token", response_model=schemas.Token)
+def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
+    user = crud.get_user_by_email(db, email=form_data.username)from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from typing import List
+
+from .. import schemas, crud, models
+from ..database import get_db
+from ..deps import get_current_user
+
+router = APIRouter()
+
+@router.post("/properties/", response_model=schemas.Property)
+def create_property(
+    prop: schemas.PropertyCreate,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(get_current_user)
+):
+    return crud.create_user_property(db=db, prop=prop, user_id=current_user.id)
+
+
+@router.get("/properties/", response_model=List[schemas.Property])
+def read_properties(
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(get_current_user)
+):
+    return crud.get_properties_by_user(db=db, user_id=current_user.id)
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+import openai
+import os
+
+from ..deps import get_current_user
+from ..schemas import User, Property
+
+router = APIRouter()
+
+# Configure OpenAI client
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+class PropertyInfo(BaseModel):
+    address: str
+    bedrooms: int
+    bathrooms: float
+    features: str
+
+class LeadInfo(BaseModel):
+    name: str
+    message: str
+    budget: Optional[str] = None
+
+@router.post("/generate-description")
+def generate_property_description(
+    property_info: PropertyInfo,
+    current_user: User = Depends(get_current_user)
+):
+    prompt = f"""
+    Generate a compelling real estate property description for a property with the following details.
+    The tone should be professional, appealing, and inviting. Highlight the key selling points.
+
+    Address: {property_info.address}
+    Bedrooms: {property_info.bedrooms}
+    Bathrooms: {property_info.bathrooms}
+    Key Features: {property_info.features}
+
+    Description:
+    """
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful real estate marketing assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=250,
+            temperature=0.7
+        )
+        description = response.choices[0].message.content.strip()
+        return {"description": description}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate description: {str(e)}")
+
+
+@router.post("/qualify-lead")
+def qualify_lead(
+    lead_info: LeadInfo,
+    current_user: User = Depends(get_current_user)
+):
+    prompt = f"""
+    You are an expert real estate assistant. Analyze the following lead and provide a qualification score from 1 (low) to 10 (high) and a brief justification.
+    Consider factors like expressed intent, budget (if provided), and specific questions asked.
+
+    Lead Name: {lead_info.name}
+    Budget: {lead_info.budget or 'Not provided'}
+    Message: "{lead_info.message}"
+
+    Analysis:
+    """
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert real estate lead qualification assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150,
+            temperature=0.5
+        )
+        analysis = response.choices[0].message.content.strip()
+        return {"lead_qualification": analysis}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to qualify lead: {str(e)}")
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from .database import get_db
+from . import crud, schemas
+
+# Password Hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, os.getenv("JWT_SECRET_KEY"), algorithm=os.getenv("ALGORITHM"))
+    return encoded_jwt
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=[os.getenv("ALGORITHM")])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        token_data = schemas.TokenData(email=email)
+    except JWTError:
+        raise credentials_exception
+    user = crud.get_user_by_email(db, email=token_data.email)
+    if user is None:
+        raise credentials_exception
+    return user
+npx create-react-app .
+npm install axios react-router-dom
+import axios from 'axios';
+
+const apiClient = axios.create({
+  baseURL: 'http://localhost:8000', // Your FastAPI backend URL
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Interceptor to add the auth token to every request
+apiClient.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// --- Auth Service ---
+export const login = (email, password) => {
+  const formData = new URLSearchParams();
+  formData.append('username', email);
+  formData.append('password', password);
+  return apiClient.post('/token', formData, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+};
+
+export const register = (email, password) => {
+  return apiClient.post('/register', { email, password });
+};
+
+export const getCurrentUser = () => {
+  return apiClient.get('/users/me');
+};
+
+
+// --- AI Assistant Service ---
+export const generateDescription = (propertyInfo) => {
+  return apiClient.post('/api/generate-description', propertyInfo);
+};
+
+export const qualifyLead = (leadInfo) => {
+  return apiClient.post('/api/qualify-lead', leadInfo);
+};
+import React, { useState, createContext } from 'react';
+import { BrowserRouter as Router, Route, Routes, Navigate } from 'react-router-dom';
+import Login from './components/Login';
+import Register from './components/Register';
+import Dashboard from './components/Dashboard';
+
+export const AuthContext = createContext();
+
+function App() {
+  const [token, setToken] = useState(localStorage.getItem('token'));
+
+  const setAuthToken = (data) => {
+    localStorage.setItem('token', data);
+    setToken(data);
+  };
+
+  return (
+    <AuthContext.Provider value={{ token, setToken: setAuthToken }}>
+      <Router>
+        <div className="App">
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Register />} />
+            <Route
+              path="/dashboard"
+              element={token ? <Dashboard /> : <Navigate to="/login" />}
+            />
+            <Route path="*" element={<Navigate to={token ? "/dashboard" : "/login"} />} />
+          </Routes>
+        </div>
+      </Router>
+    </AuthContext.Provider>
+  );
+}
+
+export default App;
+import React, { useState, useContext } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { AuthContext } from '../App';
+import { login } from '../services/api';
+
+function Login() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const { setToken } = useContext(AuthContext);
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    try {
+      const response = await login(email, password);
+      setToken(response.data.access_token);
+      navigate('/dashboard');
+    } catch (err) {
+      setError('Failed to login. Please check your credentials.');
+      console.error(err);
+    }
+  };
+
+  return (
+    <div>
+      <h2>Login</h2>
+      <form onSubmit={handleSubmit}>
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="Email"
+          required
+        />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          required
+        />
+        <button type="submit">Login</button>
+      </form>
+      {error && <p style={{ color: 'red' }}>{error}</p>}
+       <p>Don't have an account? <a href="/register">Register here</a></p>
+    </div>
+  );
+}
+
+export default Login;
+import React, { useState } from 'react';
+import { generateDescription, qualifyLead } from '../services/api';
+
+function Dashboard() {
+  const [propertyFeatures, setPropertyFeatures] = useState('');
+  const [generatedDesc, setGeneratedDesc] = useState('');
+  const [leadMessage, setLeadMessage] = useState('');
+  const [leadQualification, setLeadQualification] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleGenerateDesc = async () => {
+    if (!propertyFeatures) return;
+    setIsLoading(true);
+    setGeneratedDesc('');
+    try {
+      // Dummy data for other fields for now
+      const propertyInfo = {
+        address: '123 Main St, Kiserian',
+        bedrooms: 3,
+        bathrooms: 2.5,
+        features: propertyFeatures,
+      };
+      const response = await generateDescription(propertyInfo);
+      setGeneratedDesc(response.data.description);
+    } catch (error) {
+      console.error('Failed to generate description', error);
+      setGeneratedDesc('Error: Could not generate description.');
+    }
+    setIsLoading(false);
+  };
+
+  const handleQualifyLead = async () => {
+    if (!leadMessage) return;
+    setIsLoading(true);
+    setLeadQualification('');
+    try {
+        const leadInfo = {
+            name: "Potential Buyer",
+            message: leadMessage
+        };
+        const response = await qualifyLead(leadInfo);
+        setLeadQualification(response.data.lead_qualification)
+    } catch (error) {
+        console.error('Failed to qualify lead', error);
+        setLeadQualification('Error: Could not qualify lead.');
+    }
+    setIsLoading(false);
+  };
+
+  return (
+    <div>
+      <h1>Welcome to your AI Chief of Staff</h1>
+      
+      <hr />
+
+      <h2>AI Property Description Generator</h2>
+      <textarea
+        rows="4"
+        cols="50"
+        value={propertyFeatures}
+        onChange={(e) => setPropertyFeatures(e.target.value)}
+        placeholder="Enter key property features (e.g., 'Modern kitchen, large backyard, stunning views')"
+      />
+      <br />
+      <button onClick={handleGenerateDesc} disabled={isLoading}>
+        {isLoading ? 'Generating...' : 'Generate Description'}
+      </button>
+      {generatedDesc && (
+        <div>
+          <h3>Generated Description:</h3>
+          <p>{generatedDesc}</p>
+        </div>
+      )}
+
+      <hr />
+
+      <h2>AI Lead Qualification</h2>
+       <textarea
+        rows="4"
+        cols="50"
+        value={leadMessage}
+        onChange={(e) => setLeadMessage(e.target.value)}
+        placeholder="Paste lead's message here (e.g., 'Hi, I saw your listing online. I'd like to know more about it. My budget is around KES 15M.')"
+      />
+      <br/>
+       <button onClick={handleQualifyLead} disabled={isLoading}>
+        {isLoading ? 'Qualifying...' : 'Qualify Lead'}
+      </button>
+       {leadQualification && (
+        <div>
+          <h3>Lead Analysis:</h3>
+          <p>{leadQualification}</p>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+export default Dashboard;
+
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES")))
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/users/me", response_model=schemas.User)
+def read_users_me(current_user: schemas.User = Depends(get_current_user)):
+    return current_user
